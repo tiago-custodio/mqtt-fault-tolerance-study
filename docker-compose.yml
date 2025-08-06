@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+
+  sender:
+    build: ./sender
+    depends_on:
+      - mosquitto
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+
+  receiver:
+    build: ./receiver
+    depends_on:
+      - mosquitto
+    ports:
+      - "5001:5001"
+    environment:
+      - FLASK_ENV=development
+
+  middleware1:
+    build: ./middleware1
+    depends_on:
+      - mosquitto
+      - receiver
+    environment:
+      - MIDDLEWARE_TYPE=circuit_breaker
+
+  middleware2:
+    build: ./middleware2
+    depends_on:
+      - mosquitto
+      - receiver
+    environment:
+      - MIDDLEWARE_TYPE=replication
+    scale: 3  # Para testar replicação
+
+  middleware3:
+    build: ./middleware3
+    depends_on:
+      - mosquitto
+      - receiver
+    environment:
+      - MIDDLEWARE_TYPE=pipeline
