@@ -1,5 +1,2 @@
-# mqtt-fault-tolerance-study
-Avaliação Comparativa de Estratégias de Tolerância a Falhas em Middlewares MQTT para IoT: Circuit Breaker, Replicação Ativa e Pipeline Supervisionado
-
-## Resumo
+# Avaliação Comparativa de Estratégias de Tolerância a Falhas em Middlewares MQTT para IoT: Circuit Breaker, Replicação Ativa e Pipeline Supervisionado
 Este trabalho compara três estratégias de tolerância a falhas em middlewares MQTT: Circuit Breaker, Replicação Ativa e Pipeline Supervisionado. Testes em ambiente Docker simularam falhas e picos de carga, avaliando taxa de entrega, latência e uso de CPU. Cada abordagem mostrou vantagens específicas, servindo como base para projetos IoT resilientes e etapas futuras com sensores reais.
