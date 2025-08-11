@@ -1,52 +1,75 @@
-version: '3.8'
-
 services:
   mosquitto:
     image: eclipse-mosquitto:2.0
+    container_name: mosquitto
     ports:
       - "1883:1883"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
 
   sender:
-    build: ./sender
+    build:
+      context: ./sender
+      dockerfile: Dockerfile
+    container_name: sender
     depends_on:
-      - mosquitto
+      mosquitto:
+        condition: service_started
     ports:
       - "5000:5000"
     environment:
       - FLASK_ENV=development
 
   receiver:
-    build: ./receiver
+    build:
+      context: ./receiver
+      dockerfile: Dockerfile
+    container_name: receiver
     depends_on:
-      - mosquitto
+      mosquitto:
+        condition: service_started
     ports:
       - "5001:5001"
     environment:
       - FLASK_ENV=development
 
   middleware1:
-    build: ./middleware1
+    build:
+      context: ./middleware1
+      dockerfile: Dockerfile
+    container_name: middleware1
     depends_on:
-      - mosquitto
-      - receiver
+      mosquitto:
+        condition: service_started
+      receiver:
+        condition: service_started
     environment:
       - MIDDLEWARE_TYPE=circuit_breaker
 
   middleware2:
-    build: ./middleware2
+    build:
+      context: ./middleware2
+      dockerfile: Dockerfile
+    # ‚ùå Sem container_name para permitir m√∫ltiplas r√©plicas
     depends_on:
-      - mosquitto
-      - receiver
+      mosquitto:
+        condition: service_started
+      receiver:
+        condition: service_started
     environment:
       - MIDDLEWARE_TYPE=replication
-    scale: 3  # Para testar replicaÁ„o
+    deploy:
+      replicas: 3
 
   middleware3:
-    build: ./middleware3
+    build:
+      context: ./middleware3
+      dockerfile: Dockerfile
+    container_name: middleware3
     depends_on:
-      - mosquitto
-      - receiver
+      mosquitto:
+        condition: service_started
+      receiver:
+        condition: service_started
     environment:
       - MIDDLEWARE_TYPE=pipeline
