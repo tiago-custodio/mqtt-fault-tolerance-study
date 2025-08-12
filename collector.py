@@ -1,283 +1,191 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # collector.py
-# Coleta taxa de entrega do receiver e sender + uso de CPU de containers Docker,
-# salvando tudo em um CSV com amostras em intervalo fixo.
+#
+# Coleta, em 1 script, métricas de mensagens entregues por segundo (receiver)
+# e CPU (%) do container do middleware1, salva CSV e plota um gráfico (twin y).
+#
+# Dep.: pip install requests docker matplotlib
 
 import argparse
-import csv
+import csv  # <-- mantemos o import global e NÃO reimportamos dentro da função
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
-from docker.models.containers import Container
-
 import requests
 
-# Dependências:
-#   pip install requests docker
 try:
     import docker
-    from docker.errors import NotFound, DockerException
-except Exception:  # se docker não estiver instalado
+except Exception:
     docker = None
-    NotFound = DockerException = Exception
 
+SENDER_URL   = "http://localhost:5000"
+RECEIVER_URL = "http://localhost:5001"
 
-def iso_now() -> str:
+def iso_now():
     return datetime.now(timezone.utc).isoformat()
 
+def http_get_json(url, timeout=3.0):
+    return requests.get(url, timeout=timeout).json()
 
-def get_metrics(base_url: str, window: Optional[int] = None, timeout: float = 3.0) -> Dict:
-    """
-    Lê /metrics de um serviço (receiver ou sender).
-    Se 'window' for fornecido, envia como parâmetro.
-    """
-    if window is not None:
-        url = f"{base_url.rstrip('/')}/metrics?window={int(window)}"
-    else:
-        url = f"{base_url.rstrip('/')}/metrics"
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def http_post_json(url, timeout=3.0):
+    return requests.post(url, timeout=timeout).json()
 
-
-def cpu_percent_from_stats(stats: Dict) -> Optional[float]:
-    """
-    Calcula %CPU a partir de docker stats (stream=False).
-    Fórmula padrão Docker (cgroups v1/v2).
-    """
+def reset_endpoints():
     try:
-        cpu_stats = stats["cpu_stats"]
-        precpu_stats = stats.get("precpu_stats", {})
-        if not precpu_stats or "system_cpu_usage" not in precpu_stats:
-            return None
+        http_post_json(f"{RECEIVER_URL}/reset")
+    except Exception as e:
+        print(f"[warn] reset receiver falhou: {e}")
 
-        cpu_delta = (
-            cpu_stats["cpu_usage"]["total_usage"]
-            - precpu_stats["cpu_usage"]["total_usage"]
-        )
-        system_delta = (
-            cpu_stats["system_cpu_usage"]
-            - precpu_stats["system_cpu_usage"]
-        )
+    try:
+        requests.get(f"{SENDER_URL}/reset-stats", timeout=3.0)
+    except Exception as e:
+        print(f"[warn] reset sender falhou: {e}")
 
-        online_cpus = cpu_stats.get("online_cpus")
-        if not online_cpus:
-            online_cpus = len(cpu_stats["cpu_usage"].get("percpu_usage", [])) or 1
+def start_scenario(name, seconds, rate=None, mps=None):
+    if name == "intermittent":
+        r = http_get_json(f"{SENDER_URL}/scenario/intermittent?rate={rate if rate is not None else 0.3}&seconds={seconds}")
+    elif name == "complete":
+        r = http_get_json(f"{SENDER_URL}/scenario/complete?seconds={seconds}")
+    elif name == "overload":
+        mps = mps if mps is not None else 1000
+        r = http_get_json(f"{SENDER_URL}/scenario/overload?mps={mps}&seconds={seconds}")
+    else:
+        raise ValueError("scenario inválido")
+    return r
 
+def ensure_sender_running():
+    try:
+        requests.get(f"{SENDER_URL}/start", timeout=3.0)
+    except Exception as e:
+        print(f"[warn] não consegui startar sender: {e}")
+
+# ---- CPU de container Docker (%)
+def get_docker_client():
+    if docker is None:
+        raise RuntimeError("módulo docker não disponível. Instale com: pip install docker")
+    return docker.from_env()
+
+def cpu_percent_from_stats(prev, cur):
+    # Fórmula compatível com docker CLI
+    try:
+        cpu_delta = cur["cpu_stats"]["cpu_usage"]["total_usage"] - prev["cpu_stats"]["cpu_usage"]["total_usage"]
+        system_delta = cur["cpu_stats"]["system_cpu_usage"] - prev["cpu_stats"]["system_cpu_usage"]
+        online_cpus = cur["cpu_stats"].get("online_cpus") or cur["cpu_stats"]["cpu_usage"].get("percpu_usage") and len(cur["cpu_stats"]["cpu_usage"]["percpu_usage"]) or 1
         if system_delta > 0 and cpu_delta >= 0:
             return (cpu_delta / system_delta) * online_cpus * 100.0
-        return None
     except Exception:
-        return None
+        pass
+    return 0.0
 
+def sample_container_cpu(container):
+    # duas leituras para calcular delta
+    s1 = container.stats(stream=False)
+    time.sleep(0.3)
+    s2 = container.stats(stream=False)
+    return cpu_percent_from_stats(s1, s2)
 
-class DockerCPUReader:
-    def __init__(self, container_names: List[str], verbose: bool = False):
-        self.verbose = verbose
-        self.client = None
-        self._names = container_names
-        self._resolved: Dict[str, Optional[List[Container]]] = {}
+# ---- Coleta principal
+def collect(duration_s=120, csv_path="metrics_run.csv", scenario="intermittent", rate=0.3, mps=1000, container_name="middleware1"):
+    reset_endpoints()
+    ensure_sender_running()
+    start_scenario(scenario, duration_s, rate=rate, mps=mps)
 
-        if docker is None:
-            if self.verbose:
-                print("[DEBUG] Módulo 'docker' não está disponível. CPU ficará None.")
-            return
+    # docker client + container
+    client = get_docker_client()
+    mw = client.containers.get(container_name)
 
-        try:
-            self.client = docker.from_env()
-            _ = self.client.ping()
-            if self.verbose:
-                print("[DEBUG] Conexão com Docker OK.")
-        except Exception as e:
-            self.client = None
-            print(f"[WARN] Não foi possível acessar o Docker: {e}")
-            print("       Sugestão: adicione seu usuário ao grupo 'docker' e faça logout/login,")
-            print("       ou execute o collector com 'sudo'. CPU ficará None.")
+    started = time.perf_counter()
+    last_elapsed = -1
 
-    def _resolve_list(self, name: str) -> Optional[List[Container]]:
-        if name in self._resolved:
-            return self._resolved[name]
+    # CSV
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp","elapsed_s","delivered_per_s",
+            "successful_total","failed_total","total_messages",
+            "delivery_rate_cum","cpu_middleware1"
+        ])
 
-        if self.client is None:
-            self._resolved[name] = None
-            return None
-
-        try:
-            c = self.client.containers.get(name)
-            self._resolved[name] = [c]
-            return self._resolved[name]
-        except NotFound:
-            pass
-        except Exception as e:
-            if self.verbose:
-                print(f"[DEBUG] Erro nome exato: {e}")
-
-        try:
-            found = self.client.containers.list(
-                all=False,
-                filters={"label": f"com.docker.compose.service={name}"}
-            )
-            if found:
-                self._resolved[name] = found
-                return found
-        except Exception as e:
-            if self.verbose:
-                print(f"[DEBUG] Erro label compose: {e}")
-
-        try:
-            all_running = self.client.containers.list(all=False)
-            matches = [c for c in all_running if c.name.endswith(f"-{name}") or f"-{name}-" in c.name]
-            if matches:
-                self._resolved[name] = matches
-                return matches
-        except Exception as e:
-            if self.verbose:
-                print(f"[DEBUG] Erro padrão de nome: {e}")
-
-        self._resolved[name] = None
-        return None
-
-    def read_all(self) -> Dict[str, Optional[float]]:
-        out: Dict[str, Optional[float]] = {}
-        for name in self._names:
-            containers = self._resolve_list(name)
-            if not containers:
-                out[name] = None
+        while True:
+            now = time.perf_counter()
+            elapsed = int(now - started)
+            if elapsed == last_elapsed:
+                time.sleep(0.05)
                 continue
+            last_elapsed = elapsed
 
-            agg = 0.0
-            have_any = False
-            for cont in containers:
-                try:
-                    stats = cont.stats(stream=False)
-                    val = cpu_percent_from_stats(stats)
-                    if val is not None:
-                        agg += float(val)
-                        have_any = True
-                except Exception:
-                    continue
+            # métricas do receiver (janela=1s) + cumulativo
+            try:
+                r = http_get_json(f"{RECEIVER_URL}/metrics?window=1")
+                delivered_per_s = r.get("delivered_in_window", 0)
+                successful_total = r.get("successful", 0)
+                failed_total = r.get("failed", 0)
+                total_msgs = r.get("total_messages", successful_total + failed_total)
+                delivery_rate_cum = (successful_total / total_msgs) * 100.0 if total_msgs > 0 else 0.0
+            except Exception as e:
+                print(f"[warn] receiver/metrics erro: {e}")
+                delivered_per_s = 0
+                successful_total = failed_total = total_msgs = 0
+                delivery_rate_cum = 0.0
 
-            out[name] = round(agg, 3) if have_any else None
-        return out
+            # CPU do middleware1
+            try:
+                cpu_mw = sample_container_cpu(mw)
+            except Exception as e:
+                print(f"[warn] docker stats erro: {e}")
+                cpu_mw = 0.0
 
+            writer.writerow([
+                iso_now(), elapsed, delivered_per_s, successful_total, failed_total,
+                total_msgs, round(delivery_rate_cum, 2), round(cpu_mw, 2)
+            ])
+            f.flush()
 
-def build_header(container_names: List[str]) -> List[str]:
-    base = [
-        "ts_iso",
-        "elapsed_s",
-        "window_seconds",
-        "delivered_in_window",
-        "sent_messages",       # novo campo
-        "successful",
-        "failed",
-        "total_messages",
-        "failure_rate",
-        "throughput_total",
-        "avg_latency_ms_last10",
-        "delivery_rate",       # calculado
-    ]
-    cpu_cols = [f"cpu_{name}" for name in container_names]
-    return base + cpu_cols
+            if elapsed >= duration_s:
+                break
 
+    print(f"[ok] CSV salvo em: {csv_path}")
 
-def safe_ratio(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    # Plot: mensagens/s (Y1) + CPU% (Y2)
     try:
-        if a is None or b in (None, 0):
-            return None
-        return (float(a) / float(b)) * 100.0
-    except Exception:
-        return None
+        import matplotlib.pyplot as plt
 
+        xs, msgsps, cpu_series = [], [], []
+        with open(csv_path, "r") as f:
+            rd = csv.DictReader(f)
+            for row in rd:
+                xs.append(int(row["elapsed_s"]))
+                msgsps.append(float(row["delivered_per_s"]))
+                cpu_series.append(float(row["cpu_middleware1"]))
+
+        fig, ax1 = plt.subplots()
+        ax1.plot(xs, msgsps)
+        ax1.set_xlabel("Tempo (s)")
+        ax1.set_ylabel("Mensagens entregues por segundo")
+        ax1.grid(True, which="both", linestyle="--", alpha=0.4)
+
+        ax2 = ax1.twinx()
+        ax2.plot(xs, cpu_series)
+        ax2.set_ylabel("Uso de CPU do Middleware (%)")
+
+        plt.title(f"Mensagens/s (esq.) e CPU do Middleware (%) (dir.) — cenário: {scenario}")
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"[warn] não foi possível plotar: {e}\nInstale matplotlib com: pip install matplotlib")
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Coleta taxa de entrega usando receiver + sender e CPU de containers."
-    )
-    ap.add_argument("--receiver-url", default="http://localhost:5001",
-                    help="URL do receiver (default: http://localhost:5001)")
-    ap.add_argument("--sender-url", default="http://localhost:5000",
-                    help="URL do sender (default: http://localhost:5000)")
-    ap.add_argument("--window", type=int, default=60,
-                    help="Janela (s) para delivered_in_window (default: 60)")
-    ap.add_argument("--interval", type=float, default=2.0,
-                    help="Intervalo entre amostras em segundos (default: 2.0)")
-    ap.add_argument("--duration", type=float, default=300.0,
-                    help="Duração total da coleta (default: 300)")
-    ap.add_argument("--containers", nargs="+", default=["middleware1"],
-                    help="Containers para medir CPU")
-    ap.add_argument("--out", default="results_middleware1.csv",
-                    help="CSV de saída")
-    ap.add_argument("--verbose", action="store_true",
-                    help="Logs detalhados")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser(description="Coletor de métricas (receiver+CPU middleware) + plot")
+    p.add_argument("--duration", type=int, default=120, help="duração em segundos")
+    p.add_argument("--csv", type=str, default="metrics_run.csv", help="arquivo CSV de saída")
+    p.add_argument("--scenario", choices=["intermittent","complete","overload"], default="intermittent")
+    p.add_argument("--rate", type=float, default=0.3, help="taxa de falha intermitente (0..1)")
+    p.add_argument("--mps", type=int, default=1000, help="mensagens/seg para overload")
+    p.add_argument("--container", type=str, default="middleware1", help="nome do container do middleware")
+    args = p.parse_args()
 
-    header = build_header(args.containers)
-    cpu_reader = DockerCPUReader(args.containers, verbose=args.verbose)
-
-    start = time.time()
-    next_tick = start
-    samples = 0
-
-    with open(args.out, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-
-        try:
-            while True:
-                now = time.time()
-                if args.duration > 0 and (now - start) >= args.duration:
-                    break
-
-                try:
-                    recv = get_metrics(args.receiver_url, args.window)
-                except Exception as e:
-                    recv = {}
-                    print(f"[WARN] Erro lendo receiver: {e}")
-
-                try:
-                    send = get_metrics(args.sender_url)
-                except Exception as e:
-                    send = {}
-                    print(f"[WARN] Erro lendo sender: {e}")
-
-                cpu_map = cpu_reader.read_all()
-
-                sent_messages = send.get("total_messages") or send.get("sent_messages")
-                delivery_rate = safe_ratio(recv.get("successful"), sent_messages)
-                if delivery_rate is not None:
-                    delivery_rate = round(delivery_rate, 3)
-
-                row = [
-                    iso_now(),
-                    round(now - start, 3),
-                    args.window,
-                    recv.get("delivered_in_window"),
-                    sent_messages,
-                    recv.get("successful"),
-                    recv.get("failed"),
-                    recv.get("total_messages"),
-                    recv.get("failure_rate"),
-                    recv.get("throughput_total"),
-                    recv.get("avg_latency_ms_last10"),
-                    delivery_rate,
-                ]
-                for name in args.containers:
-                    val = cpu_map.get(name)
-                    row.append("" if val is None else round(val, 3))
-
-                w.writerow(row)
-                f.flush()
-                samples += 1
-
-                next_tick += args.interval
-                time.sleep(max(0.0, next_tick - time.time()))
-
-        except KeyboardInterrupt:
-            print("\n[INFO] Coleta interrompida pelo usuário.")
-
-    print(f"[OK] {samples} amostras salvas em '{args.out}'.")
-
+    collect(duration_s=args.duration, csv_path=args.csv, scenario=args.scenario,
+            rate=args.rate, mps=args.mps, container_name=args.container)
 
 if __name__ == "__main__":
     main()
