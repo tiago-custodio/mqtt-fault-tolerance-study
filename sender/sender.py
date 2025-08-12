@@ -19,7 +19,7 @@ state = {
     "intermittent_rate": 0.3,    # 30%
     "overload_mps": 1000,        # msgs/seg para overload
     "base_mps": 1,               # msgs/seg no modo normal
-    "complete_until": 0.0,       # epoch (segundos);  >now => falha total ativa
+    "complete_until": 0.0,       # epoch (segundos); >now => falha total ativa
     "running": True,
     "seq": 0
 }
@@ -31,7 +31,7 @@ stats = {
     "last_publish_time": None
 }
 
-# MQTT client (conexão persistente = melhor desempenho)
+# MQTT client
 client = mqtt.Client(client_id="sender_app")
 client_connected = threading.Event()
 
@@ -68,25 +68,20 @@ def generate_sensor_data(seq: int):
     }
 
 def should_force_error():
-    # cenário "complete": força falha 100% durante a janela
     if time.time() < state["complete_until"]:
         return True
-    # cenário "intermittent": probabilidade p
     if state["mode"] == "intermittent":
         return random.random() < state["intermittent_rate"]
     return False
 
 def current_rate_mps():
     if time.time() < state["complete_until"]:
-        # seguimos publicando, mas marcando forced_error (pra o receiver contar falha)
-        # mantenha a taxa alta/baixa conforme o modo ativado
         return state["overload_mps"] if state["mode"] == "overload" else state["base_mps"]
     if state["mode"] == "overload":
         return state["overload_mps"]
     return state["base_mps"]
 
 def publisher_loop():
-    # aguarda conexão
     while not client_connected.is_set():
         time.sleep(0.2)
 
@@ -96,14 +91,13 @@ def publisher_loop():
             time.sleep(0.1)
             continue
 
-        mps = max(0.0001, current_rate_mps())  # evita div/0
+        mps = max(0.0001, current_rate_mps())
         interval = 1.0 / mps
         now = time.perf_counter()
         if now < next_due:
             time.sleep(min(0.05, next_due - now))
             continue
 
-        # gerar payload
         state["seq"] += 1
         data = generate_sensor_data(state["seq"])
         if should_force_error():
@@ -112,7 +106,6 @@ def publisher_loop():
         payload = json.dumps(data, separators=(",", ":"))
 
         try:
-            # QoS 1 para simular confirmação de entrega no broker
             result = client.publish(MQTT_TOPIC, payload=payload, qos=1)
             result.wait_for_publish()
             stats["published"] += 1
@@ -174,7 +167,6 @@ def set_failure_mode(mode):
     valid = ["none", "intermittent", "complete", "overload"]
     if mode not in valid:
         return jsonify({"status": "error", "message": f"invalid mode {mode}"}), 400
-
     state["mode"] = mode
     if mode != "complete":
         state["complete_until"] = 0.0
@@ -203,12 +195,6 @@ def set_overload(mps: int):
 
 @app.route("/scenario/<name>")
 def run_scenario(name):
-    """
-    Cenários prontos para os testes do paper:
-    - /scenario/intermittent?rate=0.3&seconds=120
-    - /scenario/complete?seconds=60
-    - /scenario/overload?mps=1000&seconds=30
-    """
     secs = float(request.args.get("seconds", 60))
     if secs <= 0:
         return jsonify({"status": "error", "message": "seconds must be > 0"}), 400
@@ -246,10 +232,21 @@ def reset_stats():
     stats["last_publish_time"] = None
     return jsonify({"status": "ok"})
 
+# >>> NOVO ENDPOINT PARA O COLLECTOR <<<
+@app.route("/metrics")
+def metrics():
+    """
+    Endpoint para o collector.py pegar dados do sender.
+    Retorna contadores de mensagens e outras métricas.
+    """
+    return jsonify({
+        "total_messages": stats["published"],  # usado pelo collector para delivery_rate
+        "sent_messages": stats["published"],   # redundante para compatibilidade
+        "last_publish_time": stats["last_publish_time"],
+        "last_error": stats["last_error"]
+    })
+
 if __name__ == "__main__":
-    # thread de conexão MQTT
     threading.Thread(target=mqtt_connect_forever, daemon=True).start()
-    # thread de publicação
     threading.Thread(target=publisher_loop, daemon=True).start()
-    # servidor http
     app.run(host="0.0.0.0", port=5000)
