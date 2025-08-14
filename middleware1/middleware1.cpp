@@ -114,12 +114,7 @@ private:
         pubmsg->set_qos(1);
         client.publish(pubmsg)->wait();
         
-        // Simula 20% de chance de falha
-        static int counter = 0;
-        if (++counter % 5 == 0) {
-            std::cout << "Simulated receiver failure" << std::endl;
-            return false;
-        }
+        // Removida a simulação de falha interna: sempre retorna sucesso
         return true;
     }
 

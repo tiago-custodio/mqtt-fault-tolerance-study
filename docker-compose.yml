@@ -50,7 +50,7 @@ services:
     build:
       context: ./middleware2
       dockerfile: Dockerfile
-    # ❌ Sem container_name para permitir múltiplas réplicas
+    container_name: middleware2        # ✅ fixar nome para não permitir múltiplas réplicas
     depends_on:
       mosquitto:
         condition: service_started
@@ -58,8 +58,9 @@ services:
         condition: service_started
     environment:
       - MIDDLEWARE_TYPE=replication
-    deploy:
-      replicas: 3
+    # ❌ REMOVER este bloco se quiser apenas 1 instância:
+    # deploy:
+    #   replicas: 3
 
   middleware3:
     build:

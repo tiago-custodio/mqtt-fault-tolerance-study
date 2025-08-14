@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 # collector.py
 #
-# Coleta, em 1 script, métricas de mensagens entregues por segundo (receiver)
-# e CPU (%) do container do middleware1, salva CSV e plota um gráfico (twin y).
+# Coleta métricas do receiver (mensagens/s) e CPU (%) do container do middleware1,
+# salva CSV e plota um gráfico com dois eixos Y.
 #
 # Dep.: pip install requests docker matplotlib
 
 import argparse
-import csv  # <-- mantemos o import global e NÃO reimportamos dentro da função
+import csv
 import time
 from datetime import datetime, timezone
 import requests
@@ -35,7 +35,6 @@ def reset_endpoints():
         http_post_json(f"{RECEIVER_URL}/reset")
     except Exception as e:
         print(f"[warn] reset receiver falhou: {e}")
-
     try:
         requests.get(f"{SENDER_URL}/reset-stats", timeout=3.0)
     except Exception as e:
@@ -66,7 +65,6 @@ def get_docker_client():
     return docker.from_env()
 
 def cpu_percent_from_stats(prev, cur):
-    # Fórmula compatível com docker CLI
     try:
         cpu_delta = cur["cpu_stats"]["cpu_usage"]["total_usage"] - prev["cpu_stats"]["cpu_usage"]["total_usage"]
         system_delta = cur["cpu_stats"]["system_cpu_usage"] - prev["cpu_stats"]["system_cpu_usage"]
@@ -78,7 +76,6 @@ def cpu_percent_from_stats(prev, cur):
     return 0.0
 
 def sample_container_cpu(container):
-    # duas leituras para calcular delta
     s1 = container.stats(stream=False)
     time.sleep(0.3)
     s2 = container.stats(stream=False)
@@ -90,14 +87,15 @@ def collect(duration_s=120, csv_path="metrics_run.csv", scenario="intermittent",
     ensure_sender_running()
     start_scenario(scenario, duration_s, rate=rate, mps=mps)
 
-    # docker client + container
+    # LOG inicial de configuração
+    print(f"[collect] scenario={scenario}, duration={duration_s}s, rate={rate}, mps={mps}, container={container_name}")
+
     client = get_docker_client()
     mw = client.containers.get(container_name)
 
     started = time.perf_counter()
     last_elapsed = -1
 
-    # CSV
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -114,7 +112,6 @@ def collect(duration_s=120, csv_path="metrics_run.csv", scenario="intermittent",
                 continue
             last_elapsed = elapsed
 
-            # métricas do receiver (janela=1s) + cumulativo
             try:
                 r = http_get_json(f"{RECEIVER_URL}/metrics?window=1")
                 delivered_per_s = r.get("delivered_in_window", 0)
@@ -128,16 +125,21 @@ def collect(duration_s=120, csv_path="metrics_run.csv", scenario="intermittent",
                 successful_total = failed_total = total_msgs = 0
                 delivery_rate_cum = 0.0
 
-            # CPU do middleware1
             try:
                 cpu_mw = sample_container_cpu(mw)
             except Exception as e:
                 print(f"[warn] docker stats erro: {e}")
                 cpu_mw = 0.0
 
+            # LOG por segundo mostrando CPU com alta precisão e demais métricas básicas
+            print(f"[t+{elapsed:03d}s] msgs/s={delivered_per_s:.3f}  "
+                  f"succ={successful_total}  fail={failed_total}  "
+                  f"total={total_msgs}  rate_cum={delivery_rate_cum:.2f}%  "
+                  f"CPU={cpu_mw:.6f}%")
+
             writer.writerow([
                 iso_now(), elapsed, delivered_per_s, successful_total, failed_total,
-                total_msgs, round(delivery_rate_cum, 2), round(cpu_mw, 2)
+                total_msgs, round(delivery_rate_cum, 2), round(cpu_mw, 5)
             ])
             f.flush()
 
@@ -146,7 +148,7 @@ def collect(duration_s=120, csv_path="metrics_run.csv", scenario="intermittent",
 
     print(f"[ok] CSV salvo em: {csv_path}")
 
-    # Plot: mensagens/s (Y1) + CPU% (Y2)
+    # Plot com cores distintas e legenda
     try:
         import matplotlib.pyplot as plt
 
@@ -159,16 +161,22 @@ def collect(duration_s=120, csv_path="metrics_run.csv", scenario="intermittent",
                 cpu_series.append(float(row["cpu_middleware1"]))
 
         fig, ax1 = plt.subplots()
-        ax1.plot(xs, msgsps)
+        ln1 = ax1.plot(xs, msgsps, 'b-', label="Mensagens/s")  # azul
         ax1.set_xlabel("Tempo (s)")
-        ax1.set_ylabel("Mensagens entregues por segundo")
+        ax1.set_ylabel("Mensagens entregues por segundo", color='b')
+        ax1.tick_params(axis='y', labelcolor='b')
         ax1.grid(True, which="both", linestyle="--", alpha=0.4)
 
         ax2 = ax1.twinx()
-        ax2.plot(xs, cpu_series)
-        ax2.set_ylabel("Uso de CPU do Middleware (%)")
+        ln2 = ax2.plot(xs, cpu_series, 'r-', label="CPU Middleware (%)")  # vermelho
+        ax2.set_ylabel("Uso de CPU do Middleware (%)", color='r')
+        ax2.tick_params(axis='y', labelcolor='r')
 
-        plt.title(f"Mensagens/s (esq.) e CPU do Middleware (%) (dir.) — cenário: {scenario}")
+        lns = ln1 + ln2
+        labs = [l.get_label() for l in lns]
+        ax1.legend(lns, labs, loc='upper left')
+
+        plt.title(f"Mensagens/s (azul) e CPU do Middleware (%) (vermelho) — cenário: {scenario}")
         plt.tight_layout()
         plt.show()
     except Exception as e:
